@@ -3,6 +3,10 @@ param environmentName string = 'logicapp-sample'
 
 param location string = resourceGroup().location
 
+param vnetAddressPrefix string = '10.100.0.0/16'
+param logicAppSubnetAddressPrefix string = '10.100.0.0/24'
+param privateEndpointSubnetAddressPrefix string = '10.100.1.0/24'
+
 var resourceToken = toLower(uniqueString(subscription().id, resourceGroup().id, location))
 
 // Storage accounts: lowercase alphanumeric only, max 24 chars
@@ -12,6 +16,14 @@ var logicAppName = toLower('la-${environmentName}-${resourceToken}')
 var logicAppIdentityName = toLower('id-la-${environmentName}-${resourceToken}')
 var logAnalyticsWorkspaceName = toLower('log-${environmentName}-${resourceToken}')
 var applicationInsightsName = toLower('appi-${environmentName}-${resourceToken}')
+var vnetName = toLower('vnet-${environmentName}-${resourceToken}')
+var logicAppSubnetName = 'snet-logicapp'
+var privateEndpointSubnetName = 'snet-pe'
+var fileShareName = toLower(logicAppName)
+var privateStorageFileDnsZoneName = 'privatelink.file.${environment().suffixes.storage}'
+var privateStorageBlobDnsZoneName = 'privatelink.blob.${environment().suffixes.storage}'
+var privateStorageQueueDnsZoneName = 'privatelink.queue.${environment().suffixes.storage}'
+var privateStorageTableDnsZoneName = 'privatelink.table.${environment().suffixes.storage}'
 
 var tags = {
   SecurityControl: 'Ignore'
@@ -39,6 +51,10 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
   }
   kind: 'StorageV2'
   properties: {
+    networkAcls: {
+      bypass: 'AzureServices'
+      defaultAction: 'Deny'
+    }
     supportsHttpsTrafficOnly: true
     minimumTlsVersion: 'TLS1_2'
   }
@@ -50,6 +66,7 @@ var storageRoleIds = [
   '17d1049b-9a84-46fb-8f53-869881c3d3ab' // Storage Account Contributor
   '974c5e8b-45b9-4653-ba55-5f855dd0fb88' // Storage Queue Data Contributor
   '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3' // Storage Table Data Contributor
+  '69566ab7-960f-475b-8e7c-b3118f30c6bd' // Storage File Data Privileged Contributor
 ]
 
 resource storageAccountRbac 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
@@ -60,6 +77,146 @@ resource storageAccountRbac 'Microsoft.Authorization/roleAssignments@2022-04-01'
       roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
       principalType: 'ServicePrincipal'
       principalId: logicAppIdentity.properties.principalId
+    }
+  }
+]
+
+//
+// Virtual Network
+//
+resource vnet 'Microsoft.Network/virtualNetworks@2023-04-01' = {
+  name: vnetName
+  location: location
+  tags: tags
+  properties: {
+    addressSpace: {
+      addressPrefixes: [
+        vnetAddressPrefix
+      ]
+    }
+    subnets: [
+      {
+        name: logicAppSubnetName
+        properties: {
+          addressPrefix: logicAppSubnetAddressPrefix
+          privateEndpointNetworkPolicies: 'Enabled'
+          privateLinkServiceNetworkPolicies: 'Enabled'
+          delegations: [
+            {
+              name: 'webapp'
+              properties: {
+                serviceName: 'Microsoft.Web/serverFarms'
+              }
+            }
+          ]
+        }
+      }
+      {
+        name: privateEndpointSubnetName
+        properties: {
+          addressPrefix: privateEndpointSubnetAddressPrefix
+          privateLinkServiceNetworkPolicies: 'Enabled'
+          privateEndpointNetworkPolicies: 'Disabled'
+        }
+      }
+    ]
+  }
+}
+
+//
+// Storage File Share
+//
+resource fileService 'Microsoft.Storage/storageAccounts/fileServices@2023-01-01' = {
+  parent: storageAccount
+  name: 'default'
+}
+
+resource fileShare 'Microsoft.Storage/storageAccounts/fileServices/shares@2023-01-01' = {
+  parent: fileService
+  name: fileShareName
+}
+
+//
+// Private DNS Zones for Storage
+//
+var storageDnsZoneNames = [
+  privateStorageFileDnsZoneName
+  privateStorageBlobDnsZoneName
+  privateStorageQueueDnsZoneName
+  privateStorageTableDnsZoneName
+]
+
+resource privateDnsZones 'Microsoft.Network/privateDnsZones@2020-06-01' = [
+  for zoneName in storageDnsZoneNames: {
+    name: zoneName
+    location: 'global'
+  }
+]
+
+resource privateDnsZoneLinks 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2020-06-01' = [
+  for (zoneName, i) in storageDnsZoneNames: {
+    parent: privateDnsZones[i]
+    name: '${zoneName}-link'
+    location: 'global'
+    properties: {
+      registrationEnabled: false
+      virtualNetwork: {
+        id: vnet.id
+      }
+    }
+  }
+]
+
+//
+// Private Endpoints for Storage
+//
+var storagePrivateEndpoints = [
+  { name: '${storageAccountName}-file-pe', groupId: 'file' }
+  { name: '${storageAccountName}-blob-pe', groupId: 'blob' }
+  { name: '${storageAccountName}-queue-pe', groupId: 'queue' }
+  { name: '${storageAccountName}-table-pe', groupId: 'table' }
+]
+
+resource privateEndpoints 'Microsoft.Network/privateEndpoints@2023-04-01' = [
+  for pe in storagePrivateEndpoints: {
+    name: pe.name
+    location: location
+    tags: tags
+    properties: {
+      subnet: {
+        id: vnet.properties.subnets[1].id
+      }
+      privateLinkServiceConnections: [
+        {
+          name: pe.name
+          properties: {
+            privateLinkServiceId: storageAccount.id
+            groupIds: [
+              pe.groupId
+            ]
+          }
+        }
+      ]
+    }
+    dependsOn: [
+      fileShare
+    ]
+  }
+]
+
+resource privateDnsZoneGroups 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-04-01' = [
+  for (pe, i) in storagePrivateEndpoints: {
+    parent: privateEndpoints[i]
+    name: 'default'
+    properties: {
+      privateDnsZoneConfigs: [
+        {
+          name: 'config1'
+          properties: {
+            privateDnsZoneId: privateDnsZones[i].id
+          }
+        }
+      ]
     }
   }
 ]
@@ -124,6 +281,7 @@ resource logicApp 'Microsoft.Web/sites@2022-09-01' = {
     serverFarmId: logicAppPlan.id
     publicNetworkAccess: 'Enabled'
     httpsOnly: true
+    virtualNetworkSubnetId: vnet.properties.subnets[0].id
   }
   identity: {
     type: 'SystemAssigned, UserAssigned'
@@ -147,6 +305,14 @@ resource config 'Microsoft.Web/sites/config@2024-11-01' = {
     AzureWebJobsStorage__blobServiceUri: storageAccount.properties.primaryEndpoints.blob
     AzureWebJobsStorage__queueServiceUri: storageAccount.properties.primaryEndpoints.queue
     AzureWebJobsStorage__tableServiceUri: storageAccount.properties.primaryEndpoints.table
+
+    // Content file share
+    WEBSITE_CONTENTSHARE: fileShareName
+    WEBSITE_CONTENTAZUREFILECONNECTIONSTRING: 'DefaultEndpointsProtocol=https;AccountName=${storageAccountName};AccountKey=${storageAccount.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
+
+    // VNet routing
+    WEBSITE_VNET_ROUTE_ALL: '1'
+    WEBSITE_CONTENTOVERVNET: '1'
 
     AzureFunctionsJobHost__extensionBundle__id: 'Microsoft.Azure.Functions.ExtensionBundle.Workflows'
     AzureFunctionsJobHost__extensionBundle__version: '${'[1.*,'}${' 2.0.0)'}'
