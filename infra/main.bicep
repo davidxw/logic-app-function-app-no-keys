@@ -1,5 +1,5 @@
 @description('The name of the environment, used to generate all resource names')
-param environmentName string = 'logicapp-sample'
+param environmentName string
 
 param location string = resourceGroup().location
 

@@ -1,6 +1,9 @@
 # Logic App Standard - Azure Deployment
 
-This repo deploys an Azure Logic App Standard instance with all required infrastructure using Azure Developer CLI (`azd`).
+This repo deploys an Azure Logic App Standard instance with all required infrastructure using Azure Developer CLI (`azd`). Alternative you can use the link below:
+
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/[<URL_to_your_raw_bicep_file>](https://github.com/davidxw/logic-app-standard-no-keys/blob/main/infra/main.bicep))
+
 
 ## What gets deployed
 
