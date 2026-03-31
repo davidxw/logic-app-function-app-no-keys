@@ -11,7 +11,8 @@ param functionAppSubnetAddressPrefix string = '10.100.2.0/24'
 var resourceToken = toLower(uniqueString(subscription().id, resourceGroup().id, location))
 
 // Storage accounts: lowercase alphanumeric only, max 24 chars
-var storageAccountName = take(toLower(replace('st${environmentName}${resourceToken}', '-', '')), 24)
+var laStorageAccountName = take(toLower(replace('stla${environmentName}${resourceToken}', '-', '')), 24)
+var funcStorageAccountName = take(toLower(replace('stfn${environmentName}${resourceToken}', '-', '')), 24)
 var logicAppPlanName = toLower('la-plan-${environmentName}-${resourceToken}')
 var logicAppName = toLower('la-${environmentName}-${resourceToken}')
 var functionAppPlanName = toLower('func-plan-${environmentName}-${resourceToken}')
@@ -34,10 +35,10 @@ var tags = {
 }
 
 //
-// Storage Account (shared runtime storage for Logic App and Function App)
+// Storage Account for Logic App
 //
-resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
-  name: storageAccountName
+resource laStorageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
+  name: laStorageAccountName
   location: location
   tags: tags
   sku: {
@@ -46,6 +47,30 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
   kind: 'StorageV2'
   properties: {
     allowSharedKeyAccess: false
+    publicNetworkAccess: 'Disabled'
+    networkAcls: {
+      bypass: 'AzureServices'
+      defaultAction: 'Deny'
+    }
+    supportsHttpsTrafficOnly: true
+    minimumTlsVersion: 'TLS1_2'
+  }
+}
+
+//
+// Storage Account for Function App
+//
+resource funcStorageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
+  name: funcStorageAccountName
+  location: location
+  tags: tags
+  sku: {
+    name: 'Standard_LRS'
+  }
+  kind: 'StorageV2'
+  properties: {
+    allowSharedKeyAccess: false
+    publicNetworkAccess: 'Disabled'
     networkAcls: {
       bypass: 'AzureServices'
       defaultAction: 'Deny'
@@ -147,16 +172,12 @@ resource privateDnsZoneLinks 'Microsoft.Network/privateDnsZones/virtualNetworkLi
 //
 // Private Endpoints for Storage
 //
-var storagePrivateEndpoints = [
-  { name: '${storageAccountName}-file-pe', groupId: 'file' }
-  { name: '${storageAccountName}-blob-pe', groupId: 'blob' }
-  { name: '${storageAccountName}-queue-pe', groupId: 'queue' }
-  { name: '${storageAccountName}-table-pe', groupId: 'table' }
-]
+var storageGroupIds = ['file', 'blob', 'queue', 'table']
 
-resource privateEndpoints 'Microsoft.Network/privateEndpoints@2023-04-01' = [
-  for pe in storagePrivateEndpoints: {
-    name: pe.name
+// Private Endpoints for Logic App Storage
+resource laPrivateEndpoints 'Microsoft.Network/privateEndpoints@2023-04-01' = [
+  for groupId in storageGroupIds: {
+    name: '${laStorageAccountName}-${groupId}-pe'
     location: location
     tags: tags
     properties: {
@@ -165,11 +186,11 @@ resource privateEndpoints 'Microsoft.Network/privateEndpoints@2023-04-01' = [
       }
       privateLinkServiceConnections: [
         {
-          name: pe.name
+          name: '${laStorageAccountName}-${groupId}-pe'
           properties: {
-            privateLinkServiceId: storageAccount.id
+            privateLinkServiceId: laStorageAccount.id
             groupIds: [
-              pe.groupId
+              groupId
             ]
           }
         }
@@ -178,9 +199,51 @@ resource privateEndpoints 'Microsoft.Network/privateEndpoints@2023-04-01' = [
   }
 ]
 
-resource privateDnsZoneGroups 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-04-01' = [
-  for (pe, i) in storagePrivateEndpoints: {
-    parent: privateEndpoints[i]
+resource laPrivateDnsZoneGroups 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-04-01' = [
+  for (groupId, i) in storageGroupIds: {
+    parent: laPrivateEndpoints[i]
+    name: 'default'
+    properties: {
+      privateDnsZoneConfigs: [
+        {
+          name: 'config1'
+          properties: {
+            privateDnsZoneId: privateDnsZones[i].id
+          }
+        }
+      ]
+    }
+  }
+]
+
+// Private Endpoints for Function App Storage
+resource funcPrivateEndpoints 'Microsoft.Network/privateEndpoints@2023-04-01' = [
+  for groupId in storageGroupIds: {
+    name: '${funcStorageAccountName}-${groupId}-pe'
+    location: location
+    tags: tags
+    properties: {
+      subnet: {
+        id: vnet.properties.subnets[1].id
+      }
+      privateLinkServiceConnections: [
+        {
+          name: '${funcStorageAccountName}-${groupId}-pe'
+          properties: {
+            privateLinkServiceId: funcStorageAccount.id
+            groupIds: [
+              groupId
+            ]
+          }
+        }
+      ]
+    }
+  }
+]
+
+resource funcPrivateDnsZoneGroups 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-04-01' = [
+  for (groupId, i) in storageGroupIds: {
+    parent: funcPrivateEndpoints[i]
     name: 'default'
     properties: {
       privateDnsZoneConfigs: [
@@ -251,14 +314,14 @@ module logicApp 'modules/logicapp.bicep' = {
     appName: logicAppName
     identityName: logicAppIdentityName
     subnetId: vnet.properties.subnets[0].id
-    storageAccountId: storageAccount.id
-    storageBlobEndpoint: storageAccount.properties.primaryEndpoints.blob
-    storageQueueEndpoint: storageAccount.properties.primaryEndpoints.queue
-    storageTableEndpoint: storageAccount.properties.primaryEndpoints.table
+    storageAccountId: laStorageAccount.id
+    storageBlobEndpoint: laStorageAccount.properties.primaryEndpoints.blob
+    storageQueueEndpoint: laStorageAccount.properties.primaryEndpoints.queue
+    storageTableEndpoint: laStorageAccount.properties.primaryEndpoints.table
     appInsightsConnectionString: applicationInsights.properties.ConnectionString
   }
   dependsOn: [
-    privateDnsZoneGroups
+    laPrivateDnsZoneGroups
   ]
 }
 
@@ -274,12 +337,12 @@ module functionApp 'modules/functionapp.bicep' = {
     appName: functionAppName
     identityName: functionAppIdentityName
     subnetId: vnet.properties.subnets[2].id
-    storageAccountId: storageAccount.id
-    storageAccountName: storageAccount.name
+    storageAccountId: funcStorageAccount.id
+    storageAccountName: funcStorageAccount.name
     appInsightsConnectionString: applicationInsights.properties.ConnectionString
   }
   dependsOn: [
-    privateDnsZoneGroups
+    funcPrivateDnsZoneGroups
   ]
 }
 
