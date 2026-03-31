@@ -31,6 +31,18 @@ param storageTableEndpoint string
 @description('Application Insights connection string')
 param appInsightsConnectionString string
 
+@description('Resource ID of the Key Vault for content storage connection string')
+param keyVaultId string
+
+@description('Resource ID of the content storage account')
+param contentStorageAccountId string
+
+@description('Key Vault reference for content storage connection string')
+param contentStorageConnectionStringReference string
+
+@description('Name of the content file share')
+param contentShareName string
+
 //
 // User-Assigned Managed Identity
 //
@@ -68,6 +80,23 @@ resource storageRbac 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
 ]
 
 //
+// Key Vault RBAC — Key Vault Secrets User for the user-assigned identity
+//
+resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
+  name: last(split(keyVaultId, '/'))
+}
+
+resource kvRbac 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: keyVault
+  name: guid(identity.id, keyVaultId, '4633458b-17de-408a-b874-0445c86b69e6')
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6') // Key Vault Secrets User
+    principalType: 'ServicePrincipal'
+    principalId: identity.properties.principalId
+  }
+}
+
+//
 // Logic App Plan (Workflow Standard WS1)
 //
 resource plan 'Microsoft.Web/serverfarms@2022-09-01' = {
@@ -97,6 +126,7 @@ resource app 'Microsoft.Web/sites@2022-09-01' = {
     publicNetworkAccess: 'Enabled'
     httpsOnly: true
     virtualNetworkSubnetId: subnetId
+    keyVaultReferenceIdentity: identity.id
   }
   identity: {
     type: 'SystemAssigned, UserAssigned'
@@ -134,6 +164,11 @@ resource config 'Microsoft.Web/sites/config@2024-11-01' = {
 
     APPLICATIONINSIGHTS_CONNECTION_STRING: appInsightsConnectionString
     APPLICATIONINSIGHTS_AUTHENTICATION_STRING: 'Authorization=AAD'
+
+    // Content file share via Key Vault reference
+    WEBSITE_CONTENTAZUREFILECONNECTIONSTRING: contentStorageConnectionStringReference
+    WEBSITE_CONTENTSHARE: contentShareName
+
     WORKFLOWS_RESOURCE_GROUP_NAME: resourceGroup().name
     WORKFLOWS_SUBSCRIPTION_ID: subscription().subscriptionId
     WORKFLOWS_LOCATION_NAME: location
@@ -143,4 +178,4 @@ resource config 'Microsoft.Web/sites/config@2024-11-01' = {
 }
 
 output name string = app.name
-output principalId string = app.identity.principalId
+output identityPrincipalId string = identity.properties.principalId

@@ -13,6 +13,11 @@ var resourceToken = toLower(uniqueString(subscription().id, resourceGroup().id, 
 // Storage accounts: lowercase alphanumeric only, max 24 chars
 var laStorageAccountName = take(toLower(replace('stla${environmentName}${resourceToken}', '-', '')), 24)
 var funcStorageAccountName = take(toLower(replace('stfn${environmentName}${resourceToken}', '-', '')), 24)
+var laContentStorageAccountName = take(toLower(replace('stlac${environmentName}${resourceToken}', '-', '')), 24)
+var funcContentStorageAccountName = take(toLower(replace('stfnc${environmentName}${resourceToken}', '-', '')), 24)
+var laContentShareName = 'la-content'
+var funcContentShareName = 'func-content'
+var keyVaultName = take(toLower(replace('kv-${environmentName}-${resourceToken}', '-', '')), 24)
 var logicAppPlanName = toLower('la-plan-${environmentName}-${resourceToken}')
 var logicAppName = toLower('la-${environmentName}-${resourceToken}')
 var functionAppPlanName = toLower('func-plan-${environmentName}-${resourceToken}')
@@ -30,12 +35,13 @@ var privateStorageFileDnsZoneName = 'privatelink.file.${environment().suffixes.s
 var privateStorageBlobDnsZoneName = 'privatelink.blob.${environment().suffixes.storage}'
 var privateStorageQueueDnsZoneName = 'privatelink.queue.${environment().suffixes.storage}'
 var privateStorageTableDnsZoneName = 'privatelink.table.${environment().suffixes.storage}'
+var privateKeyVaultDnsZoneName = 'privatelink.vaultcore.azure.net'
 
 var tags = {
 }
 
 //
-// Storage Account for Logic App
+// Web Job Storage Account for Logic App
 //
 resource laStorageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
   name: laStorageAccountName
@@ -58,7 +64,7 @@ resource laStorageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
 }
 
 //
-// Storage Account for Function App
+// Web Job Storage Account for Function App
 //
 resource funcStorageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
   name: funcStorageAccountName
@@ -78,6 +84,72 @@ resource funcStorageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
     supportsHttpsTrafficOnly: true
     minimumTlsVersion: 'TLS1_2'
   }
+}
+
+//
+// Content Storage Account for Logic App (file shares, keys enabled)
+//
+resource laContentStorageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
+  name: laContentStorageAccountName
+  location: location
+  tags: tags
+  sku: {
+    name: 'Standard_LRS'
+  }
+  kind: 'StorageV2'
+  properties: {
+    allowSharedKeyAccess: true
+    publicNetworkAccess: 'Disabled'
+    networkAcls: {
+      bypass: 'AzureServices'
+      defaultAction: 'Deny'
+    }
+    supportsHttpsTrafficOnly: true
+    minimumTlsVersion: 'TLS1_2'
+  }
+}
+
+resource laContentFileService 'Microsoft.Storage/storageAccounts/fileServices@2023-01-01' = {
+  parent: laContentStorageAccount
+  name: 'default'
+}
+
+resource laContentShare 'Microsoft.Storage/storageAccounts/fileServices/shares@2023-01-01' = {
+  parent: laContentFileService
+  name: laContentShareName
+}
+
+//
+// Content Storage Account for Function App (file shares, keys enabled)
+//
+resource funcContentStorageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
+  name: funcContentStorageAccountName
+  location: location
+  tags: tags
+  sku: {
+    name: 'Standard_LRS'
+  }
+  kind: 'StorageV2'
+  properties: {
+    allowSharedKeyAccess: true
+    publicNetworkAccess: 'Disabled'
+    networkAcls: {
+      bypass: 'AzureServices'
+      defaultAction: 'Deny'
+    }
+    supportsHttpsTrafficOnly: true
+    minimumTlsVersion: 'TLS1_2'
+  }
+}
+
+resource funcContentFileService 'Microsoft.Storage/storageAccounts/fileServices@2023-01-01' = {
+  parent: funcContentStorageAccount
+  name: 'default'
+}
+
+resource funcContentShare 'Microsoft.Storage/storageAccounts/fileServices/shares@2023-01-01' = {
+  parent: funcContentFileService
+  name: funcContentShareName
 }
 
 //
@@ -259,6 +331,183 @@ resource funcPrivateDnsZoneGroups 'Microsoft.Network/privateEndpoints/privateDns
 ]
 
 //
+// Private DNS Zone for Key Vault
+//
+resource keyVaultDnsZone 'Microsoft.Network/privateDnsZones@2020-06-01' = {
+  name: privateKeyVaultDnsZoneName
+  location: 'global'
+}
+
+resource keyVaultDnsZoneLink 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2020-06-01' = {
+  parent: keyVaultDnsZone
+  name: '${privateKeyVaultDnsZoneName}-link'
+  location: 'global'
+  properties: {
+    registrationEnabled: false
+    virtualNetwork: {
+      id: vnet.id
+    }
+  }
+}
+
+//
+// Private Endpoints for Content Storage Accounts (file only)
+//
+resource laContentPrivateEndpoint 'Microsoft.Network/privateEndpoints@2023-04-01' = {
+  name: '${laContentStorageAccountName}-file-pe'
+  location: location
+  tags: tags
+  properties: {
+    subnet: {
+      id: vnet.properties.subnets[1].id
+    }
+    privateLinkServiceConnections: [
+      {
+        name: '${laContentStorageAccountName}-file-pe'
+        properties: {
+          privateLinkServiceId: laContentStorageAccount.id
+          groupIds: [
+            'file'
+          ]
+        }
+      }
+    ]
+  }
+}
+
+resource laContentPrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-04-01' = {
+  parent: laContentPrivateEndpoint
+  name: 'default'
+  properties: {
+    privateDnsZoneConfigs: [
+      {
+        name: 'config1'
+        properties: {
+          privateDnsZoneId: privateDnsZones[0].id // file DNS zone
+        }
+      }
+    ]
+  }
+}
+
+resource funcContentPrivateEndpoint 'Microsoft.Network/privateEndpoints@2023-04-01' = {
+  name: '${funcContentStorageAccountName}-file-pe'
+  location: location
+  tags: tags
+  properties: {
+    subnet: {
+      id: vnet.properties.subnets[1].id
+    }
+    privateLinkServiceConnections: [
+      {
+        name: '${funcContentStorageAccountName}-file-pe'
+        properties: {
+          privateLinkServiceId: funcContentStorageAccount.id
+          groupIds: [
+            'file'
+          ]
+        }
+      }
+    ]
+  }
+}
+
+resource funcContentPrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-04-01' = {
+  parent: funcContentPrivateEndpoint
+  name: 'default'
+  properties: {
+    privateDnsZoneConfigs: [
+      {
+        name: 'config1'
+        properties: {
+          privateDnsZoneId: privateDnsZones[0].id // file DNS zone
+        }
+      }
+    ]
+  }
+}
+
+//
+// Key Vault
+//
+resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
+  name: keyVaultName
+  location: location
+  tags: tags
+  properties: {
+    sku: {
+      family: 'A'
+      name: 'standard'
+    }
+    tenantId: subscription().tenantId
+    enableRbacAuthorization: true
+    enabledForTemplateDeployment: true
+    publicNetworkAccess: 'Disabled'
+    enableSoftDelete: false
+    networkAcls: {
+      bypass: 'AzureServices'
+      defaultAction: 'Deny'
+    }
+  }
+}
+
+resource keyVaultPrivateEndpoint 'Microsoft.Network/privateEndpoints@2023-04-01' = {
+  name: '${keyVaultName}-pe'
+  location: location
+  tags: tags
+  properties: {
+    subnet: {
+      id: vnet.properties.subnets[1].id
+    }
+    privateLinkServiceConnections: [
+      {
+        name: '${keyVaultName}-pe'
+        properties: {
+          privateLinkServiceId: keyVault.id
+          groupIds: [
+            'vault'
+          ]
+        }
+      }
+    ]
+  }
+}
+
+resource keyVaultPrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-04-01' = {
+  parent: keyVaultPrivateEndpoint
+  name: 'default'
+  properties: {
+    privateDnsZoneConfigs: [
+      {
+        name: 'config1'
+        properties: {
+          privateDnsZoneId: keyVaultDnsZone.id
+        }
+      }
+    ]
+  }
+}
+
+//
+// Key Vault Secrets — content storage connection strings
+//
+resource laContentConnectionStringSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+  parent: keyVault
+  name: 'la-content-storage-connection-string'
+  properties: {
+    value: 'DefaultEndpointsProtocol=https;AccountName=${laContentStorageAccount.name};AccountKey=${laContentStorageAccount.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
+  }
+}
+
+resource funcContentConnectionStringSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+  parent: keyVault
+  name: 'func-content-storage-connection-string'
+  properties: {
+    value: 'DefaultEndpointsProtocol=https;AccountName=${funcContentStorageAccount.name};AccountKey=${funcContentStorageAccount.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
+  }
+}
+
+//
 // Log Analytics & Application Insights
 //
 resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2021-12-01-preview' = {
@@ -281,24 +530,24 @@ resource applicationInsights 'Microsoft.Insights/components@2020-02-02' = {
   }
 }
 
-// Monitoring Metrics Publisher role for app system-assigned identities on App Insights
+// Monitoring Metrics Publisher role for app user-assigned identities on App Insights
 resource appInsightsRbacLogicApp 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: applicationInsights
-  name: guid(logicAppName, 'appInsights', '3913510d-42f4-4e42-8a64-420c390055eb')
+  name: guid(logicAppIdentityName, 'appInsights', '3913510d-42f4-4e42-8a64-420c390055eb')
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '3913510d-42f4-4e42-8a64-420c390055eb') // Monitoring Metrics Publisher
     principalType: 'ServicePrincipal'
-    principalId: logicApp.outputs.principalId
+    principalId: logicApp.outputs.identityPrincipalId
   }
 }
 
 resource appInsightsRbacFunctionApp 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: applicationInsights
-  name: guid(functionAppName, 'appInsights', '3913510d-42f4-4e42-8a64-420c390055eb')
+  name: guid(functionAppIdentityName, 'appInsights', '3913510d-42f4-4e42-8a64-420c390055eb')
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '3913510d-42f4-4e42-8a64-420c390055eb') // Monitoring Metrics Publisher
     principalType: 'ServicePrincipal'
-    principalId: functionApp.outputs.principalId
+    principalId: functionApp.outputs.identityPrincipalId
   }
 }
 
@@ -319,9 +568,15 @@ module logicApp 'modules/logicapp.bicep' = {
     storageQueueEndpoint: laStorageAccount.properties.primaryEndpoints.queue
     storageTableEndpoint: laStorageAccount.properties.primaryEndpoints.table
     appInsightsConnectionString: applicationInsights.properties.ConnectionString
+    keyVaultId: keyVault.id
+    contentStorageAccountId: laContentStorageAccount.id
+    contentStorageConnectionStringReference: '@Microsoft.KeyVault(SecretUri=${laContentConnectionStringSecret.properties.secretUri})'
+    contentShareName: laContentShareName
   }
   dependsOn: [
     laPrivateDnsZoneGroups
+    laContentPrivateDnsZoneGroup
+    keyVaultPrivateDnsZoneGroup
   ]
 }
 
@@ -340,9 +595,15 @@ module functionApp 'modules/functionapp.bicep' = {
     storageAccountId: funcStorageAccount.id
     storageAccountName: funcStorageAccount.name
     appInsightsConnectionString: applicationInsights.properties.ConnectionString
+    keyVaultId: keyVault.id
+    contentStorageAccountId: funcContentStorageAccount.id
+    contentStorageConnectionStringReference: '@Microsoft.KeyVault(SecretUri=${funcContentConnectionStringSecret.properties.secretUri})'
+    contentShareName: funcContentShareName
   }
   dependsOn: [
     funcPrivateDnsZoneGroups
+    funcContentPrivateDnsZoneGroup
+    keyVaultPrivateDnsZoneGroup
   ]
 }
 
